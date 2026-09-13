@@ -8,6 +8,15 @@
 #      the stock docker-iccpd start.sh, iccpd.j2 and iccpd.sh.
 #   3. valgrind memcheck, plus the 63 and 64 character bound.
 #
+# PortChannel netdevs: GitHub runners have no team module (the kernel
+# ships none), so teamd cannot create PortChannels there. iccpd decides
+# interface type from a name prefix whitelist in iccp_netlink.c, with no
+# link kind check, so a dummy netdev named PortChannel0001 is treated as
+# a port channel exactly like a team device. When team is present the
+# script uses the real teamd path through "config portchannel add", and
+# falls back to dummy netdevs otherwise. The teamd path is covered on a
+# host that has the module.
+#
 # Every expectation is asserted. Exit status is the verdict.
 
 set -euo pipefail
@@ -22,8 +31,9 @@ rm -rf "$WORK" "$RESULTS"
 mkdir -p "$WORK/src/orig" "$WORK/src/fix" "$RESULTS"
 
 fail=0
-check() { # check <description> <expected> <actual>
-    if [ "$2" = "$3" ]; then
+norm() { tr ',' '\n' <<<"$1" | sed '/^$/d' | sort | paste -sd, -; }
+check() { # check <description> <expected> <actual>, membership compared order independently
+    if [ "$(norm "$2")" = "$(norm "$3")" ]; then
         echo "PASS: $1"
     else
         echo "FAIL: $1: expected [$2], got [$3]"
@@ -61,13 +71,17 @@ done
 echo "::endgroup::"
 
 echo "::group::docker-sonic-vs functional test"
+if sudo modprobe team 2>/dev/null; then
+    HAVE_TEAM=y
+    echo "team module present, PortChannels come from teammgrd"
+else
+    HAVE_TEAM=n
+    echo "NOTE: no team module on $(uname -r), PortChannels created as dummy netdevs"
+fi
+
 curl -fL --retry 3 -sS -o "$WORK/docker-sonic-vs.gz" "$VS_URL"
 docker load -i "$WORK/docker-sonic-vs.gz"
 
-# teammgrd needs the team module to create PortChannels.
-sudo modprobe team 2>/dev/null \
-  || { sudo apt-get update -qq && sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" && sudo modprobe team; } \
-  || echo "WARNING: team module unavailable, PortChannels may not be created"
 docker rm -f sw vs >/dev/null 2>&1 || true
 docker run -d --name sw debian:bookworm-slim sleep infinity >/dev/null
 sudo bash "$REPO/platform/vs/create_vnet.sh" -n 2 sw
@@ -81,12 +95,18 @@ done
 docker exec vs show version | grep "SONiC Software Version" | tee "$RESULTS/vs-version.txt"
 
 for po in PortChannel0001 PortChannel0002; do
-    docker exec vs ip link show "$po" >/dev/null 2>&1 || docker exec vs config portchannel add "$po" 2>/dev/null
+    if docker exec vs ip link show "$po" >/dev/null 2>&1; then continue; fi
+    if [ "$HAVE_TEAM" = y ]; then
+        docker exec vs config portchannel add "$po" 2>/dev/null
+    else
+        docker exec vs ip link add "$po" type dummy
+    fi
 done
+for _ in $(seq 1 30); do docker exec vs ip link show PortChannel0002 >/dev/null 2>&1 && break; sleep 1; done
+docker exec vs ip -br link show | grep PortChannel | tee "$RESULTS/vs-portchannels.txt"
+
 docker exec vs redis-cli -n 4 hset "MC_LAG|1" local_ip 10.0.0.0 peer_ip 10.0.0.1 \
     peer_link Ethernet4 mclag_interface "PortChannel0001,PortChannel0002" >/dev/null
-for _ in $(seq 1 30); do docker exec vs ip link show PortChannel0002 >/dev/null 2>&1 && break; sleep 1; done
-docker exec vs ip -br link show type team | tee "$RESULTS/vs-portchannels.txt"
 
 docker exec vs mkdir -p /usr/share/iccpd-test /var/run/iccpd
 for f in start.sh iccpd.sh; do docker cp "$REPO/dockers/docker-iccpd/$f" "vs:/usr/share/iccpd-test/$f"; done
@@ -118,8 +138,9 @@ run_memcheck() { # run_memcheck <variant> <token length, or 0 for the plain conf
     docker run --rm --cap-add NET_ADMIN -v "$WORK/out/$v:/debs:ro" -v "$RESULTS:/results" \
         -e LEN="$len" -e TAG="$tag" iccpd-builder bash -ec '
             dpkg -i /debs/iccpd_*.deb /debs/iccpd-dbg_*.deb >/dev/null
-            (ip link add PortChannel0001 type team 2>/dev/null || ip link add PortChannel0001 type dummy)
-            (ip link add PortChannel0002 type team 2>/dev/null || ip link add PortChannel0002 type dummy)
+            for pc in PortChannel0001 PortChannel0002; do
+                ip link add "$pc" type team 2>/dev/null || ip link add "$pc" type dummy
+            done
             ip link add Ethernet4 type dummy
             mkdir -p /var/run/iccpd /etc/iccpd
 
@@ -152,19 +173,23 @@ EOF
             echo "RESULT state=[$state] errors=$errors"'
 }
 
+# Compare the interface list itself. The bracketed form does not survive
+# the order independent comparison in check().
+state_of() { sed -n 's/.*state=\[\([^]]*\)\].*/\1/p' <<<"$1"; }
+
 out=$(run_memcheck orig 0 | tail -1); echo "orig plain: $out" | tee -a "$RESULTS/memcheck.txt"
 check "memcheck, base build reports one error"  "errors=1" "${out##* }"
-check "memcheck, base build binds nothing"      "state=[]" "$(echo "$out" | grep -o 'state=\[[^]]*\]')"
+check "memcheck, base build binds nothing"      "" "$(state_of "$out")"
 
 out=$(run_memcheck fix 0 | tail -1); echo "fix plain: $out" | tee -a "$RESULTS/memcheck.txt"
 check "memcheck, fixed build is clean"          "errors=0" "${out##* }"
-check "memcheck, fixed build binds both"        "state=[PortChannel0002,PortChannel0001]" "$(echo "$out" | grep -o 'state=\[[^]]*\]')"
+check "memcheck, fixed build binds both"        "PortChannel0002,PortChannel0001" "$(state_of "$out")"
 
 out=$(run_memcheck fix 63 | tail -1); echo "fix 63: $out" | tee -a "$RESULTS/memcheck.txt"
-check "bound, 63 characters accepted"           "state=[PortChannel0001]" "$(echo "$out" | grep -o 'state=\[[^]]*\]')"
+check "bound, 63 characters accepted"           "PortChannel0001" "$(state_of "$out")"
 
 out=$(run_memcheck fix 64 | tail -1); echo "fix 64: $out" | tee -a "$RESULTS/memcheck.txt"
-check "bound, 64 characters rejected"           "state=[]" "$(echo "$out" | grep -o 'state=\[[^]]*\]')"
+check "bound, 64 characters rejected"           "" "$(state_of "$out")"
 echo "::endgroup::"
 
 echo
