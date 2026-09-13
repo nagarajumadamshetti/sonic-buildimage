@@ -239,7 +239,9 @@ echo "::endgroup::"
 echo
 if [ "$fail" -eq 0 ]; then
     echo "VERDICT: passed. Bug reproduced on the base build and gone on this branch."
-    [ "$skipped" -gt 0 ] && echo "         $skipped bind dependent checks skipped, see notes above."
+    if [ "$skipped" -gt 0 ]; then
+        echo "         $skipped bind dependent checks skipped, see notes above."
+    fi
 else
     echo "VERDICT: one or more checks failed"
 fi
