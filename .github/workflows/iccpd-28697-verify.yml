@@ -1,0 +1,44 @@
+name: iccpd 28697 verify
+
+# Verification for the fix to sonic-net/sonic-buildimage#28697, run on a
+# native amd64 runner. Builds the iccpd package from the base commit and
+# from this branch, then checks both against the official docker-sonic-vs
+# image and under valgrind. Every expectation is asserted, so a green run
+# means the bug reproduced on the base build and is gone on this one.
+#
+# This workflow lives only on the verification branch of the fork. It is
+# not part of the change proposed upstream.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'ci/iccpd-28697-verify'
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Environment
+        run: |
+          uname -srm
+          docker version --format 'docker {{.Server.Version}} {{.Server.Arch}}'
+          df -h / | tail -1
+          echo "base commit: $(git rev-parse HEAD^)"
+
+      - name: Verify
+        run: bash .github/ci-iccpd-28697/verify.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iccpd-28697-results
+          path: ci-results/
+          if-no-files-found: warn

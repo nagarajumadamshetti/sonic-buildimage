@@ -135,7 +135,7 @@ int iccp_config_from_command(char * line)
                 cp++;
 
             slen = cp - start;
-            if (slen > strlen(token))
+            if (slen >= (int)sizeof(token))
             {
                 return MCLAG_ERROR;
             }
