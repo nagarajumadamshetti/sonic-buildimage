@@ -116,10 +116,20 @@ for v in orig fix; do
     docker exec vs bash -c 'pkill -9 -f "^bash /usr/share/iccpd-test/iccpd.sh"; pkill -9 -x mclagsyncd; pkill -9 -x iccpd; true'
     docker exec vs rm -f /var/run/iccpd/mclagdctl.sock
     docker cp "$WORK/out/$v/." "vs:/tmp/iccpd-$v/"
-    docker exec vs bash -c "dpkg -i /tmp/iccpd-$v/iccpd_*.deb >/dev/null"
+    docker exec vs bash -c "dpkg -i /tmp/iccpd-$v/iccpd_*.deb" \
+        || { echo "FAIL: $v package did not install in the vs container"; fail=1; continue; }
     docker exec vs bash /usr/share/iccpd-test/start.sh
     docker exec -d vs bash /usr/share/iccpd-test/iccpd.sh
     for _ in $(seq 1 60); do docker exec vs test -S /var/run/iccpd/mclagdctl.sock && break; sleep 1; done
+    if ! docker exec vs test -S /var/run/iccpd/mclagdctl.sock; then
+        echo "FAIL: $v iccpd did not create its control socket. Diagnostics:"
+        docker exec vs bash -c 'echo "--- iccpd processes:"; ps -eo pid,args | grep -E "iccpd|mclagsyncd" | grep -v grep
+            echo "--- ldd /usr/bin/iccpd:";  ldd /usr/bin/iccpd 2>&1 | grep -E "not found|libnl" | head
+            echo "--- /var/log/iccpd.log:";  tail -20 /var/log/iccpd.log 2>&1
+            echo "--- rendered config:";     cat /etc/iccpd/iccpd.conf 2>&1' || true
+        fail=1
+        continue
+    fi
     sleep 3
     state=$(docker exec vs mclagdctl -i 1 dump state | sed -n 's/^MCLAG Interface: //p' | tr -d '\r')
     echo "$v: MCLAG Interface: [$state]" | tee -a "$RESULTS/sonic-vs.txt"
