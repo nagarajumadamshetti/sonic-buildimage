@@ -30,7 +30,7 @@ jobs:
           uname -srm
           docker version --format 'docker {{.Server.Version}} {{.Server.Arch}}'
           df -h / | tail -1
-          echo "base commit: $(git rev-parse HEAD^)"
+          echo "base commit: $(git merge-base HEAD origin/master)"
 
       - name: Verify
         run: bash .github/ci-iccpd-28697/verify.sh

@@ -22,7 +22,10 @@
 set -euo pipefail
 
 REPO=$(git rev-parse --show-toplevel)
-BASE=${BASE:-$(git rev-parse HEAD^)}
+# Where this branch left master. HEAD^ is wrong: the branch accumulates
+# CI commits, so after the first one HEAD^ already contains the fix and
+# the base build would be compared against itself.
+BASE=${BASE:-$(git merge-base HEAD origin/master)}
 WORK=$REPO/ci-work
 RESULTS=$REPO/ci-results
 VS_URL="https://sonic-build.azurewebsites.net/api/sonic/artifacts?branchName=master&platform=vs&target=target/docker-sonic-vs.gz"
@@ -119,14 +122,19 @@ for v in orig fix; do
     docker exec vs bash -c "dpkg -i /tmp/iccpd-$v/iccpd_*.deb" \
         || { echo "FAIL: $v package did not install in the vs container"; fail=1; continue; }
     docker exec vs bash /usr/share/iccpd-test/start.sh
-    docker exec -d vs bash /usr/share/iccpd-test/iccpd.sh
+    # Keep the daemon output. docker exec -d discards it, which hid the
+    # cause when iccpd failed to come up.
+    docker exec -d vs bash -c 'bash /usr/share/iccpd-test/iccpd.sh > /tmp/iccpd-run.log 2>&1'
     for _ in $(seq 1 60); do docker exec vs test -S /var/run/iccpd/mclagdctl.sock && break; sleep 1; done
     if ! docker exec vs test -S /var/run/iccpd/mclagdctl.sock; then
         echo "FAIL: $v iccpd did not create its control socket. Diagnostics:"
-        docker exec vs bash -c 'echo "--- iccpd processes:"; ps -eo pid,args | grep -E "iccpd|mclagsyncd" | grep -v grep
-            echo "--- ldd /usr/bin/iccpd:";  ldd /usr/bin/iccpd 2>&1 | grep -E "not found|libnl" | head
-            echo "--- /var/log/iccpd.log:";  tail -20 /var/log/iccpd.log 2>&1
-            echo "--- rendered config:";     cat /etc/iccpd/iccpd.conf 2>&1' || true
+        docker exec vs bash -c 'echo "--- installed package:"; dpkg -l iccpd 2>&1 | tail -2
+            echo "--- binaries:";           ls -l /usr/bin/iccpd /usr/bin/mclagdctl /usr/bin/mclagsyncd 2>&1
+            echo "--- iccpd.sh output:";    cat /tmp/iccpd-run.log 2>&1
+            echo "--- processes:";          ps -eo pid,args | grep -E "iccpd|mclagsyncd" | grep -v grep
+            echo "--- ldd:";                ldd /usr/bin/iccpd 2>&1 | head -5
+            echo "--- /var/log/iccpd.log:"; tail -20 /var/log/iccpd.log 2>&1
+            echo "--- rendered config:";    cat /etc/iccpd/iccpd.conf 2>&1' || true
         fail=1
         continue
     fi
